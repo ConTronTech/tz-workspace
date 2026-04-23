@@ -1,5 +1,65 @@
 # tz-workspace
 
+## For most people: what is this?
+
+Short version: it's a tiny app that changes your computer's clock to
+another city's time with one click, and keeps notes and copy-paste
+snippets attached to each place you save.
+
+If your job ever involves working with people in different time zones
+(calling an office in another state, supporting customers overseas,
+scheduling meetings with remote teammates) and you keep having to do
+mental math like "wait, is it 3 PM there or 4 PM?" - this tool makes
+that a non-issue.
+
+### What can I actually do with it?
+
+- **Save a place**, for example "Memphis Office", and tie it to that
+  city's time zone. Next time you're helping the Memphis office, click
+  that place once and your whole computer (clock, calendar, meeting
+  times in email) is now on Memphis time. Click "Go Home" to switch
+  back.
+- **See two clocks at once** at the top of the window - your current
+  time and your Home time - with a little orange tag showing the
+  difference (like "+1h") whenever they don't match. No more almost
+  working an extra hour because you forgot you were on a different
+  zone.
+- **Type notes for each place** (the office address, who the manager
+  is, the direct line) and they automatically come back when you pick
+  that place again.
+- **Save copy-paste snippets** per place - phone numbers, email
+  templates, commands, anything you repeat. Click Copy, paste
+  anywhere.
+- **Search any city or zone in the world** - including typos. Type
+  "memfis tenisee" and it'll still find Memphis, Tennessee.
+
+### How do I start?
+
+1. Open the app.
+2. On the left, click **My Places** > **+ Add place**, type a
+   nickname like "Office" or "Chicago Team", and pick the time zone
+   from the list.
+3. Click your saved place. That's it - the computer is now on that
+   time zone, and the right side of the window shows notes and
+   snippets for it.
+4. Click **Go Home** (top right) anytime to switch back to your own
+   time zone.
+
+### Why bother with this over a website or phone app?
+
+- It changes the *actual system clock*, not just shows you a number.
+  Your calendar, your email timestamps, your meeting reminders - all
+  of it lines up with the zone you switched to.
+- It's offline. No sign-in, no account, no ads, no "would you like to
+  subscribe" popup. Runs local on your machine.
+- Notes and snippets live with each place, so you don't end up
+  juggling sticky notes or a separate app for "stuff about the
+  Memphis office."
+
+---
+
+## For developers
+
 A timezone-aware workspace for Linux that combines system timezone switching
 with per-location notes and snippets. Built with GTK4 / gtkmm-4.0 and backed
 by SQLite.
