@@ -1,0 +1,15 @@
+# Build artifacts
+*.o
+*.d
+/tz-workspace
+
+# Editor scratch
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# OS noise
+.DS_Store
+Thumbs.db
