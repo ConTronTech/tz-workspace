@@ -84,6 +84,7 @@ private:
     Gtk::Label          settings_home_lbl_;
     Gtk::CheckButton    settings_24h_chk_;
     Gtk::CheckButton    settings_seconds_chk_;
+    Gtk::CheckButton    settings_sw_render_chk_;
 
     // --- Right pane: Workspace ---
     Gtk::Box       active_row_;

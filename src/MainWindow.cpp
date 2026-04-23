@@ -264,6 +264,43 @@ static void install_app_icon() {
     if (theme) theme->add_search_path(icons_root.string());
 }
 
+// Renderer pref lives as a tiny sidecar file rather than in the SQLite DB —
+// main.cpp reads it BEFORE GTK initializes (to set GSK_RENDERER env var),
+// and opening the DB that early would pull in SQLite before the rest of the
+// app is ready. One file, one line, easy to tail or edit by hand.
+static fs::path renderer_pref_path() {
+    const char* xdg  = std::getenv("XDG_DATA_HOME");
+    const char* home = std::getenv("HOME");
+    fs::path base;
+    if (xdg && *xdg && fs::path(xdg).is_absolute()) base = xdg;
+    else if (home && *home && fs::path(home).is_absolute())
+        base = fs::path(home) / ".local" / "share";
+    else base = "/tmp";
+    return base / "tz-workspace" / "renderer.conf";
+}
+
+static std::string read_renderer_pref() {
+    std::ifstream f(renderer_pref_path());
+    if (!f) return "";
+    std::string pref;
+    std::getline(f, pref);
+    while (!pref.empty() &&
+           (pref.back() == '\n' || pref.back() == '\r' ||
+            pref.back() == ' '  || pref.back() == '\t')) {
+        pref.pop_back();
+    }
+    return pref;
+}
+
+static void write_renderer_pref(const std::string& val) {
+    fs::path p = renderer_pref_path();
+    std::error_code ec;
+    fs::create_directories(p.parent_path(), ec);
+    if (ec) return;
+    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    if (f) f << val << "\n";
+}
+
 static fs::path db_path() {
     // Refuse relative or empty env paths — we chmod 0700 on the parent dir, and
     // a crafted relative path could redirect that operation outside $HOME.
@@ -299,6 +336,7 @@ MainWindow::MainWindow()
       settings_tab_(Gtk::Orientation::VERTICAL, 10),
       settings_24h_chk_("Use 24-hour clock"),
       settings_seconds_chk_("Show seconds in clock"),
+      settings_sw_render_chk_("Use software rendering (lighter memory; takes effect next launch)"),
       active_row_(Gtk::Orientation::HORIZONTAL, 6),
       switch_active_btn_("\xe2\x9a\xa1 Switch to this zone"),
       clear_active_btn_("Close"),
@@ -691,9 +729,14 @@ void MainWindow::build_ui() {
     // small-tile snapping.
     auto* settings_scroll = Gtk::make_managed<Gtk::ScrolledWindow>();
     settings_scroll->set_child(settings_tab_);
-    settings_scroll->set_policy(Gtk::PolicyType::NEVER, Gtk::PolicyType::AUTOMATIC);
+    // AUTOMATIC on both axes: if content overflows narrow viewports the user
+    // gets a scrollbar instead of silently-clipped text. NEVER here was
+    // causing labels with unbreakable tokens (paths, zone names) to overrun
+    // their allocation and paint over each other at small widths.
+    settings_scroll->set_policy(Gtk::PolicyType::AUTOMATIC, Gtk::PolicyType::AUTOMATIC);
     settings_scroll->set_has_frame(false);
     settings_scroll->set_vexpand(true);
+    settings_scroll->set_propagate_natural_width(false);
     left_stack_.add(loc_tab_, "places",   "My Places");
     left_stack_.add(fav_tab_, "pinned",   "Pinned");
     left_stack_.add(all_tab_, "all",      "All Timezones");
@@ -868,12 +911,16 @@ void MainWindow::refresh_current_label() {
     std::string cur = svc_->current_zone();
     if (cur.empty() || cur == "(unknown)") {
         current_lbl_.set_markup("<b>Couldn't detect your timezone</b>");
+        current_lbl_.set_tooltip_text(
+            "The system timezone couldn't be read. Check that timedatectl works.");
         return;
     }
     std::string city = friendly_zone(cur);
     current_lbl_.set_markup(
         "\xf0\x9f\x93\x8d <b>" + Glib::Markup::escape_text(city) + "</b>"
         "<span alpha='55%'>  \xc2\xb7 " + Glib::Markup::escape_text(cur) + "</span>");
+    current_lbl_.set_tooltip_text(
+        "Current system timezone: " + city + " (" + cur + ")");
 }
 
 void MainWindow::update_home_state() {
@@ -881,6 +928,9 @@ void MainWindow::update_home_state() {
     const std::string cur = svc_->current_zone();
     if (h.empty()) {
         home_lbl_.set_markup("<span alpha='70%'>\xf0\x9f\x8f\xa0 Home not set</span>");
+        home_lbl_.set_tooltip_text(
+            "No Home timezone saved. Set one in Settings to get a one-click "
+            "Go Home shortcut.");
         home_clock_lbl_.set_visible(false);
         revert_btn_.set_visible(false);
     } else {
@@ -891,11 +941,16 @@ void MainWindow::update_home_state() {
                 "<span foreground='#2ea043'>\xe2\x9c\x93</span> "
                 "<span alpha='75%'>Home: </span><b>" +
                 Glib::Markup::escape_text(h_city) + "</b>");
+            home_lbl_.set_tooltip_text(
+                "Currently at Home: " + h_city + " (" + h + ")");
             revert_btn_.set_visible(false);
         } else {
             home_lbl_.set_markup(
                 "<span alpha='75%'>\xf0\x9f\x8f\xa0 Home: </span><b>" +
                 Glib::Markup::escape_text(h_city) + "</b>");
+            home_lbl_.set_tooltip_text(
+                "Home timezone: " + h_city + " (" + h + "). "
+                "Click Go Home to switch back.");
             revert_btn_.set_visible(true);
             revert_btn_.set_sensitive(true);
             revert_btn_.set_tooltip_text(
@@ -1072,6 +1127,11 @@ void MainWindow::refresh_locations() {
         row->set_child(*hbox);
         row->set_activatable(true);
         if (is_active) row->add_css_class("active-location");
+        // Tooltip shows full name + zone even when the row is narrow and the
+        // labels ellipsize. Clicking the row activates it; hover shows context.
+        row->set_tooltip_text(
+            loc.name + " \xc2\xb7 " + friendly_zone(loc.zone) +
+            " (" + loc.zone + ")");
         loc_list_.append(*row);
         loc_row_ids_.push_back(loc.id);
     }
@@ -1103,6 +1163,9 @@ static Gtk::ListBoxRow* make_zone_row(
     lbl->set_halign(Gtk::Align::FILL);
     lbl->set_ellipsize(Pango::EllipsizeMode::END);
     lbl->set_width_chars(0);
+    // Full text in a hover tooltip so a narrow pane never hides the zone.
+    row->set_tooltip_text(
+        (city == tz) ? tz : (city + " \xc2\xb7 " + tz));
 
     auto* sw = Gtk::make_managed<Gtk::Button>("Switch");
     sw->add_css_class("flat");
@@ -1181,7 +1244,12 @@ void MainWindow::build_all_list() {
             Glib::Markup::escape_text(al.zone) + "</span>");
         lbl->set_xalign(0.0f);
         lbl->set_hexpand(true);
+        lbl->set_halign(Gtk::Align::FILL);
         lbl->set_ellipsize(Pango::EllipsizeMode::END);
+        lbl->set_width_chars(0);
+        // Hover the row to see the full "Display · IANA zone" pair even
+        // when the label is ellipsized at narrow widths.
+        row->set_tooltip_text(al.display + " \xc2\xb7 " + al.zone);
 
         auto* sw = Gtk::make_managed<Gtk::Button>("Switch");
         sw->add_css_class("flat");
@@ -1265,6 +1333,9 @@ void MainWindow::refresh_active_banner() {
             "to see its notes and snippets. "
             "Or click \"+ New snippet\" to save a general one."
             "</span>");
+        active_lbl_.set_tooltip_text(
+            "Pick a place on the left to see its notes and snippets. "
+            "Or click \"+ New snippet\" to save a general one.");
         clear_active_btn_.set_visible(false);
         switch_active_btn_.set_visible(false);
         notes_title_.set_text("Notes");
@@ -1274,6 +1345,8 @@ void MainWindow::refresh_active_banner() {
         active_lbl_.set_markup(
             "Viewing: <b>" + Glib::Markup::escape_text(l.name) + "</b> "
             "<span alpha='60%'>\xc2\xb7 " + Glib::Markup::escape_text(city) + "</span>");
+        active_lbl_.set_tooltip_text(
+            "Viewing " + l.name + " \xc2\xb7 " + city + " (" + l.zone + ")");
         switch_active_btn_.set_visible(true);
         clear_active_btn_.set_visible(true);
         clear_active_btn_.set_sensitive(true);
@@ -1339,6 +1412,10 @@ void MainWindow::refresh_snippets() {
                         "<span alpha='60%'>[" +
                         Glib::Markup::escape_text(sn.category) + "]</span>");
         lbl->set_xalign(0.0f);
+        lbl->set_ellipsize(Pango::EllipsizeMode::END);
+        lbl->set_width_chars(0);
+        lbl->set_halign(Gtk::Align::FILL);
+        lbl->set_hexpand(true);
 
         auto* preview = Gtk::make_managed<Gtk::Label>();
         Glib::ustring up(sn.content);
@@ -1349,6 +1426,10 @@ void MainWindow::refresh_snippets() {
         preview->set_text(p);
         preview->set_xalign(0.0f);
         preview->add_css_class("dim-label");
+        preview->set_ellipsize(Pango::EllipsizeMode::END);
+        preview->set_width_chars(0);
+        preview->set_halign(Gtk::Align::FILL);
+        preview->set_hexpand(true);
 
         textbox->append(*lbl);
         textbox->append(*preview);
@@ -1378,6 +1459,14 @@ void MainWindow::refresh_snippets() {
         hbox->append(*edit_btn);
         hbox->append(*rm_btn);
         row->set_child(*hbox);
+        // Tooltip on the whole row with the label, category, and full
+        // content — the Copy button grabs the content, but hover lets the
+        // user preview everything including long bodies that truncated above.
+        std::string tip = sn.label;
+        if (!sn.category.empty()) tip += "  [" + sn.category + "]";
+        tip += "\n\n";
+        tip += sn.content;
+        row->set_tooltip_text(tip);
         sn_list_.append(*row);
     }
 }
@@ -1457,94 +1546,154 @@ void MainWindow::copy_to_clipboard(const std::string& text, const std::string& l
 // =============================================================
 
 void MainWindow::build_settings_tab() {
-    pad(settings_tab_, 12);
+    pad(settings_tab_, 6);
 
-    auto make_heading = [](const std::string& s) {
-        auto* lbl = Gtk::make_managed<Gtk::Label>();
-        lbl->set_markup("<b>" + Glib::Markup::escape_text(s) + "</b>");
-        lbl->set_xalign(0.0f);
-        lbl->add_css_class("heading");
-        return lbl;
+    // Settings lay out as a bordered-rows ListBox — one row per setting,
+    // short inline title, control on the right, and a tooltip on the row
+    // that carries the "why". Fits the full settings surface into a narrow
+    // column without scrolling past verbose hint paragraphs.
+    auto* list = Gtk::make_managed<Gtk::ListBox>();
+    list->set_selection_mode(Gtk::SelectionMode::NONE);
+    list->add_css_class("bordered-rows");
+    list->set_vexpand(false);
+
+    auto make_row = [](Gtk::Widget& left,
+                       Gtk::Widget* right,
+                       const std::string& tooltip) -> Gtk::ListBoxRow* {
+        auto* row = Gtk::make_managed<Gtk::ListBoxRow>();
+        row->set_selectable(false);
+        row->set_activatable(false);
+        row->set_tooltip_text(tooltip);
+        auto* hbox = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 8);
+        hbox->set_margin_top(4);
+        hbox->set_margin_bottom(4);
+        hbox->set_margin_start(8);
+        hbox->set_margin_end(6);
+        left.set_hexpand(true);
+        hbox->append(left);
+        if (right) hbox->append(*right);
+        row->set_child(*hbox);
+        return row;
     };
-    auto make_hint = [](const std::string& s) {
-        auto* lbl = Gtk::make_managed<Gtk::Label>(s);
-        lbl->set_xalign(0.0f);
-        lbl->set_wrap(true);
-        lbl->add_css_class("dim-label");
-        return lbl;
-    };
 
-    // -- Home zone group --
-    settings_tab_.append(*make_heading("Home timezone"));
-    settings_tab_.append(*make_hint(
-        "\"Home\" is the zone you want to return to. Go Home in the top bar "
-        "snaps your computer's clock back here."));
-
-    settings_home_lbl_.set_xalign(0.0f);
-    settings_home_lbl_.set_wrap(true);
-    settings_home_lbl_.add_css_class("title-4");
-    settings_tab_.append(settings_home_lbl_);
-
-    auto* home_btns = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 6);
-    set_home_btn_.set_label("Use current zone as Home");
-    set_home_btn_.add_css_class("suggested-action");
-    clear_home_btn_.set_label("Clear Home");
+    // Row: Home timezone — title + current value stacked on the left,
+    //      [Make current] [Clear] buttons on the right.
+    auto* home_left = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::VERTICAL, 0);
+    {
+        auto* title = Gtk::make_managed<Gtk::Label>();
+        title->set_markup("<b>Home timezone</b>");
+        title->set_xalign(0.0f);
+        home_left->append(*title);
+        settings_home_lbl_.set_xalign(0.0f);
+        settings_home_lbl_.set_wrap(false);
+        settings_home_lbl_.set_ellipsize(Pango::EllipsizeMode::END);
+        settings_home_lbl_.set_width_chars(0);
+        settings_home_lbl_.add_css_class("dim-label");
+        home_left->append(settings_home_lbl_);
+    }
+    set_home_btn_.set_label("Make current");
+    set_home_btn_.add_css_class("flat");
+    clear_home_btn_.set_label("Clear");
+    clear_home_btn_.add_css_class("flat");
+    auto* home_btns = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 4);
+    home_btns->set_valign(Gtk::Align::CENTER);
     home_btns->append(set_home_btn_);
     home_btns->append(clear_home_btn_);
-    settings_tab_.append(*home_btns);
+    list->append(*make_row(*home_left, home_btns,
+        "The zone you want to return to. Make current saves whatever your "
+        "system is set to right now as your Home. Go Home in the top bar "
+        "switches the system clock back to this zone in one click."));
 
-    auto* sep1 = Gtk::make_managed<Gtk::Separator>();
-    sep1->set_margin_top(6);
-    sep1->set_margin_bottom(6);
-    settings_tab_.append(*sep1);
-
-    // -- Clock group --
-    settings_tab_.append(*make_heading("Clock"));
+    // Row: 24-hour clock
     settings_24h_chk_.signal_toggled().connect([this] {
         db_->set_setting("clock_24h", settings_24h_chk_.get_active() ? "1" : "0");
         tick_clock();
     });
+    auto* c24_title = Gtk::make_managed<Gtk::Label>();
+    c24_title->set_markup("<b>24-hour clock</b>");
+    c24_title->set_xalign(0.0f);
+    c24_title->set_ellipsize(Pango::EllipsizeMode::END);
+    c24_title->set_width_chars(0);
+    settings_24h_chk_.set_label("");
+    settings_24h_chk_.set_valign(Gtk::Align::CENTER);
+    list->append(*make_row(*c24_title, &settings_24h_chk_,
+        "Show times as 14:30 instead of 2:30 PM in the top-bar clocks."));
+
+    // Row: Show seconds
     settings_seconds_chk_.signal_toggled().connect([this] {
         db_->set_setting("clock_seconds", settings_seconds_chk_.get_active() ? "1" : "0");
         tick_clock();
     });
-    settings_tab_.append(settings_24h_chk_);
-    settings_tab_.append(settings_seconds_chk_);
+    auto* sec_title = Gtk::make_managed<Gtk::Label>();
+    sec_title->set_markup("<b>Show seconds</b>");
+    sec_title->set_xalign(0.0f);
+    sec_title->set_ellipsize(Pango::EllipsizeMode::END);
+    sec_title->set_width_chars(0);
+    settings_seconds_chk_.set_label("");
+    settings_seconds_chk_.set_valign(Gtk::Align::CENTER);
+    list->append(*make_row(*sec_title, &settings_seconds_chk_,
+        "Tick the clock every second instead of every minute. Slightly more "
+        "CPU, noticeably more useful when you're watching a meeting time."));
 
-    auto* sep2 = Gtk::make_managed<Gtk::Separator>();
-    sep2->set_margin_top(6);
-    sep2->set_margin_bottom(6);
-    settings_tab_.append(*sep2);
-
-    // -- System tools --
-    settings_tab_.append(*make_heading("System"));
-    auto* sys_row = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 6);
-    sys_row->append(refresh_btn_);
-    auto* reimport = Gtk::make_managed<Gtk::Button>("Re-import legacy data");
-    reimport->set_tooltip_text(
-        "Pull any saved zones/favorites from the old time-zone-changer config.");
+    // Row: System — two buttons on the right.
+    auto* sys_title = Gtk::make_managed<Gtk::Label>();
+    sys_title->set_markup("<b>System</b>");
+    sys_title->set_xalign(0.0f);
+    sys_title->set_ellipsize(Pango::EllipsizeMode::END);
+    sys_title->set_width_chars(0);
+    refresh_btn_.set_label("Re-check");
+    refresh_btn_.add_css_class("flat");
+    auto* reimport = Gtk::make_managed<Gtk::Button>("Re-import");
+    reimport->add_css_class("flat");
     reimport->signal_clicked().connect([this] {
         db_->delete_setting("legacy_imported");
         svc_->import_legacy_config();
         refresh_all();
         set_status("Legacy data re-imported.");
     });
-    sys_row->append(*reimport);
-    settings_tab_.append(*sys_row);
+    auto* sys_btns = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::HORIZONTAL, 4);
+    sys_btns->set_valign(Gtk::Align::CENTER);
+    sys_btns->append(refresh_btn_);
+    sys_btns->append(*reimport);
+    list->append(*make_row(*sys_title, sys_btns,
+        "Re-check reads timedatectl again to update the top-bar current "
+        "zone if something else changed it. Re-import pulls any "
+        "saved zones or favorites from the legacy time-zone-changer "
+        "config directory (safe to run multiple times)."));
 
-    auto* sep3 = Gtk::make_managed<Gtk::Separator>();
-    sep3->set_margin_top(6);
-    sep3->set_margin_bottom(6);
-    settings_tab_.append(*sep3);
+    // Row: Software rendering
+    settings_sw_render_chk_.signal_toggled().connect([this] {
+        write_renderer_pref(settings_sw_render_chk_.get_active() ? "sw" : "");
+    });
+    auto* swr_title = Gtk::make_managed<Gtk::Label>();
+    swr_title->set_markup("<b>Software rendering</b>");
+    swr_title->set_xalign(0.0f);
+    swr_title->set_ellipsize(Pango::EllipsizeMode::END);
+    swr_title->set_width_chars(0);
+    settings_sw_render_chk_.set_label("");
+    settings_sw_render_chk_.set_valign(Gtk::Align::CENTER);
+    list->append(*make_row(*swr_title, &settings_sw_render_chk_,
+        "Draw the UI in Cairo (software) instead of letting GTK pick GPU "
+        "acceleration. Helpful on VMs, remote X sessions, and Windows "
+        "builds without a working GPU driver. Saves ~10 MB on Linux "
+        "with drivers installed, more on systems without them. Takes "
+        "effect on next launch."));
 
-    // -- About --
+    // Row: About — no right widget, title carries both app tag and data path.
     auto* about = Gtk::make_managed<Gtk::Label>();
     about->set_markup(
-        "<b>TZ Workspace</b>  <span alpha='65%'>\xc2\xb7 local build</span>\n"
-        "<span alpha='70%'>Data: ~/.local/share/tz-workspace/data.db</span>");
+        "<b>TZ Workspace</b>  <span alpha='65%'>\xc2\xb7 local build</span>");
     about->set_xalign(0.0f);
-    about->set_wrap(true);
-    settings_tab_.append(*about);
+    about->set_ellipsize(Pango::EllipsizeMode::END);
+    about->set_width_chars(0);
+    list->append(*make_row(*about, nullptr,
+        "TZ Workspace, local dev build.\n"
+        "Data: ~/.local/share/tz-workspace/data.db\n"
+        "Icon: ~/.local/share/tz-workspace/icons/hicolor/scalable/apps/tz-workspace.svg\n"
+        "Renderer pref: ~/.local/share/tz-workspace/renderer.conf\n"
+        "Desktop entry: ~/.local/share/applications/local.tzworkspace.app.desktop"));
+
+    settings_tab_.append(*list);
 }
 
 void MainWindow::refresh_settings_tab() {
@@ -1561,6 +1710,8 @@ void MainWindow::refresh_settings_tab() {
     // Avoid firing toggled signal back into ourselves while syncing.
     settings_24h_chk_.set_active(db_->get_setting("clock_24h")     == "1");
     settings_seconds_chk_.set_active(db_->get_setting("clock_seconds") == "1");
+    const std::string rp = read_renderer_pref();
+    settings_sw_render_chk_.set_active(rp == "sw" || rp == "cairo");
 }
 
 // =============================================================
